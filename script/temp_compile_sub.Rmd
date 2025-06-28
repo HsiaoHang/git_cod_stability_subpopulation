@@ -1,0 +1,205 @@
+---
+title: "temp_compile"
+output: html_document
+date: "2025-03-10"
+---
+
+This script compiles temperature data from three subpopulations into one csv file.
+
+# set directory
+```{r}
+
+# set directory
+dr <- "/Users/hsiaohang.tao/Dropbox/a_Chang_MDR/Demo_R_Code_MDR_S-MAP/mc_subpopulation"
+
+```
+
+
+# library: general
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+library("tidyverse")
+library("purrr")
+library("mapplots")
+library("ggplot2")
+library("gridExtra")
+library("igraph")
+library(igraphdata)
+library("ggplot2")
+library(grid)
+library(cowplot)
+library(ggtext)
+library(zoo)
+library(readxl)
+
+```
+
+
+# housekeeping northwestern 
+bottle and low-resolution ctd data by drawing polygons of each subpopulation in the ices data portal.
+```{r}
+
+# read temperature data
+temp.northwestern.dd <- read.csv("/Users/hsiaohang.tao/Dropbox/a_Chang_MDR/Demo_R_Code_MDR_S-MAP/mc_subpopulation/data/driver_data/ctd_raw_data/northwestern_ctd_low.csv")
+
+temp.northwestern.raw <- temp.northwestern.dd %>% 
+  dplyr::select(Cruise, Station, 
+                yyyy.mm.ddThh.mm.ss.sss,
+                Latitude..degrees_north.,
+                Longitude..degrees_east., 
+                Depth..ADEPZZ01_ULAA...m.,
+                Temperature..TEMPPR01_UPAA...degC.) %>% 
+  rename(year = yyyy.mm.ddThh.mm.ss.sss,
+         lat = Latitude..degrees_north.,
+         lon = Longitude..degrees_east.,
+         depth = Depth..ADEPZZ01_ULAA...m.,
+         temp = Temperature..TEMPPR01_UPAA...degC.) 
+
+# yearly temp for viking
+temp.northwestern <- temp.northwestern.raw %>% 
+  separate(year, c('Year', 'month', NA)) %>% 
+  # keep depth between 0-200
+  filter(depth <=200) %>% 
+  mutate_at('month', as.numeric) %>% 
+  # keep only winter months
+  filter(month <=3) %>% 
+  group_by(Cruise, Station, Year) %>% 
+  # obtain mean temp from 0-200m for each station
+  summarise(mean_temp = mean(temp, na.rm = TRUE)) %>% 
+  group_by(Year) %>% 
+  # obtain yearly mean temp by averaging from all stations
+  summarise(Mean_temp = mean(mean_temp, na.rm = TRUE))%>% 
+  mutate(region = 'northwestern')
+  
+# boundary of ctd data: 4.0402	-11.9683	61.96	54.5083	
+temp.northwestern.raw %>% 
+  summarise(east = max(lon),
+            west = min(lon),
+            north = max(lat),
+            south = min(lat))
+  
+# most deep: 2921 meter
+temp.northwestern.dd %>% 
+  dplyr::select(Depth..ADEPZZ01_ULAA...m.) %>% 
+  summarise(max = max(Depth..ADEPZZ01_ULAA...m.)) 
+```
+
+
+# housekeeping southern
+bottle and low-resolution ctd data by drawing polygons of each subpopulation in the ices data portal.
+```{r}
+
+# read temperature data
+temp.southern.dd <- read.csv("/Users/hsiaohang.tao/Dropbox/a_Chang_MDR/Demo_R_Code_MDR_S-MAP/mc_subpopulation/data/driver_data/ctd_raw_data/southern_ctd_low.csv")
+
+temp.southern.raw <- temp.southern.dd %>% 
+  dplyr::select(Cruise, Station, 
+                yyyy.mm.ddThh.mm.ss.sss,
+                Latitude..degrees_north.,
+                Longitude..degrees_east., 
+                Depth..ADEPZZ01_ULAA...m.,
+                Temperature..TEMPPR01_UPAA...degC.) %>% 
+  rename(year = yyyy.mm.ddThh.mm.ss.sss,
+         lat = Latitude..degrees_north.,
+         lon = Longitude..degrees_east.,
+         depth = Depth..ADEPZZ01_ULAA...m.,
+         temp = Temperature..TEMPPR01_UPAA...degC.) 
+
+# yearly temp for viking
+temp.southern <- temp.southern.raw %>% 
+  separate(year, c('Year', 'month', NA)) %>% 
+  # keep depth between 0-200
+  filter(depth <=200) %>% 
+  mutate_at('month', as.numeric) %>% 
+  # keep only winter months
+  filter(month <=3) %>% 
+  group_by(Cruise, Station, Year) %>% 
+  # obtain mean temp from 0-200m for each station
+  summarise(mean_temp = mean(temp, na.rm = TRUE)) %>% 
+  group_by(Year) %>% 
+  # obtain yearly mean temp by averaging from all stations
+  summarise(Mean_temp = mean(mean_temp, na.rm = TRUE))%>% 
+  mutate(region = 'southern')
+  
+# boundary of ctd data: 8.9617	-2.059	56.9885	49.2993	
+temp.southern.raw %>% 
+  summarise(east = max(lon),
+            west = min(lon),
+            north = max(lat),
+            south = min(lat))
+  
+# most deep: 428 meter
+temp.southern.dd %>% 
+  dplyr::select(Depth..ADEPZZ01_ULAA...m.) %>% 
+  summarise(max = max(Depth..ADEPZZ01_ULAA...m.)) #
+
+```
+
+
+# housekeeping viking
+bottle and low-resolution ctd data by drawing polygons of each subpopulation in the ices data portal.
+```{r}
+
+# read temperature data
+temp.viking.dd <- read.csv("/Users/hsiaohang.tao/Dropbox/a_Chang_MDR/Demo_R_Code_MDR_S-MAP/mc_subpopulation/data/driver_data/ctd_raw_data/viking_ctd_low.csv")
+
+temp.viking.raw <- temp.viking.dd %>% 
+  dplyr::select(Cruise, Station, 
+                yyyy.mm.ddThh.mm.ss.sss,
+                Latitude..degrees_north.,
+                Longitude..degrees_east., 
+                Depth..ADEPZZ01_ULAA...m.,
+                Temperature..TEMPPR01_UPAA...degC.) %>% 
+  rename(year = yyyy.mm.ddThh.mm.ss.sss,
+         lat = Latitude..degrees_north.,
+         lon = Longitude..degrees_east.,
+         depth = Depth..ADEPZZ01_ULAA...m.,
+         temp = Temperature..TEMPPR01_UPAA...degC.) 
+
+# yearly temp for viking
+temp.viking <- temp.viking.raw %>% 
+  separate(year, c('Year', 'month', NA)) %>% 
+  # keep depth between 0-200
+  filter(depth <=200) %>% 
+  mutate_at('month', as.numeric) %>% 
+  # keep only winter months
+  filter(month <=3) %>% 
+  group_by(Cruise, Station, Year) %>% 
+  # obtain mean temp from 0-200m for each station
+  summarise(mean_temp = mean(temp, na.rm = TRUE)) %>% 
+  group_by(Year) %>% 
+  # obtain yearly mean temp by averaging from all stations
+  summarise(Mean_temp = mean(mean_temp, na.rm = TRUE)) %>% 
+  mutate(region = 'viking')
+  
+# boundary of ctd data: 11.907	-1.0042	61.931	56.9945
+temp.viking.raw %>% 
+  summarise(east = max(lon),
+            west = min(lon),
+            north = max(lat),
+            south = min(lat))
+  
+# most deep: 628 meter
+temp.viking.dd %>% 
+  dplyr::select(Depth..ADEPZZ01_ULAA...m.) %>% 
+  summarise(max = max(Depth..ADEPZZ01_ULAA...m.)) 
+```
+
+
+# bind for 3 subpopulations
+```{r}
+
+temp.ctd <- bind_rows(temp.northwestern, temp.southern,temp.viking)
+
+temp.ctd <- temp.ctd %>% 
+  relocate(region, .before = Year) %>% 
+  dplyr::select(-X)
+
+write.csv(temp.ctd,"/Users/hsiaohang.tao/Dropbox/a_Chang_MDR/Demo_R_Code_MDR_S-MAP/mc_subpopulation/data/driver_data/temp.ctd.csv")
+
+```
+
+
+

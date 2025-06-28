@@ -1,0 +1,559 @@
+---
+title: "mc_mdr_smap_subarea"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+
+This script is to generate yearly jacobian marix for each of the three North Sea cod subpopulation using MDR-Smap. There are two steps: 
+1. Prepare data
+2. Run MDR S-map using example codes in <Demo_MDR_Smap_20210625.R>
+
+
+# ----- Step 1. Prepare data
+
+# set directory
+
+```{r}
+
+# set directory
+dr <- "/Users/hsiaohang.tao/Dropbox/a_Chang_MDR/Demo_R_Code_MDR_S-MAP/mc_subpopulation"
+
+```
+
+
+# load packages
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+library("tidyverse")
+library("purrr")
+library("mapplots")
+library("ggplot2")
+library("gridExtra")
+library("igraph")
+library(igraphdata)
+library(readxl)
+library(vegan)
+library(rEDM) 
+packageVersion("rEDM")
+library(doParallel)
+library(parallel)
+library(foreach)
+library(Kendall)
+library(MASS)
+library(dplyr)
+library(glmnet)
+
+```
+
+
+# source Demo_MDR_function.R
+
+```{r}
+
+source("/Users/hsiaohang.tao/Dropbox/a_Chang_MDR/Demo_R_Code_MDR_S-MAP/mc/script/Demo_MDR_function.R")
+
+```
+
+# general settings
+
+```{r}
+seed <- 49563
+set.seed(seed)
+SaveFile <- T #T/F for saving files
+
+```
+
+
+# read subpopulation data and arrange
+<subpopulation_data.csv>
+[[1]] northwestern
+[[2]] southern
+[[3]] viking
+
+```{r}
+
+# read data
+file.name <- paste0(dr, sep = "/","data/raw_data/subpopulation_data.xlsx")
+
+(dd <-  read_excel(file.name))
+
+# remove total abundance and year, create list <sub> by region
+sub <- dd %>% dplyr::select(-total) %>% 
+  dplyr::select(-year) %>% 
+  group_split(region)
+
+```
+
+
+# normalise data 
+
+Use codes from <Demo_MDR_Smap_20210625.R> to normalise data.
+Alternatively, use scale() to normalise.
+
+```{r}
+
+# Read dataset
+sub
+
+# for loop
+sub.ds <- list()
+sub.ds.test <- list()
+sub.ds.tp1 <- list()
+sub.ds.all <- list()
+
+for (i in 1:length(sub)){ 
+
+da.range <- 1:nrow(sub[[i]]) # Subsample for data analysis
+out.sample <- F # T/F for out-of-sample forecast
+if(out.sample){nout <- 2}else{nout <- 0}  # number of out-of-sample
+
+# (da.name <- 'mc_model202310_6_age')
+#do <- read.csv('mc_data_6_age_20231021.csv',header=T,stringsAsFactors = F)
+do <- sub[[i]]
+dot <- do[da.range,1] # data time
+do <- do[da.range,-1] # time series of community data
+ndo <- nrow(do)
+nin <- ndo-nout # library sample size
+
+
+# In-sample
+do.mean <- apply(do[1:nin,],2,mean,na.rm=T)  # mean abundance in in-sample
+do.sd <- apply(do[1:nin,],2,sd,na.rm=T)      # SD of abundance in in-sample
+d <- do[1:(nin-1),]                          # In-sample dataset at time t
+d_tp1 <- do[2:(nin),]                        # In-sample dataset at time t+1
+ds <- (d-repmat(do.mean,nrow(d),1))*repmat(do.sd,nrow(d),1)^-1 # Normalized in-sample dataset at time t
+ds_tp1 <- (d_tp1-repmat(do.mean,nrow(d_tp1),1))*repmat(do.sd,nrow(d_tp1),1)^-1 # Normalized in-sample dataset at time t+1
+
+# Out-sample
+if(out.sample|nout!=0){
+  d.test <- do[nin:(ndo-1),]                 # Out-of-sample dataset at time t 
+  dt_tp1 <- do[(nin+1):ndo,]                 # Out-of-sample dataset at time t+1
+  ds.test <- (d.test-repmat(do.mean,nrow(d.test),1))*repmat(do.sd,nrow(d.test),1)^-1 # Normalized out-of-sample dataset at time t
+  dst_tp1 <- (dt_tp1-repmat(do.mean,nrow(dt_tp1),1))*repmat(do.sd,nrow(dt_tp1),1)^-1 # Normalized out-of-sample dataset at time t+1
+}else{d.test <- dt_tp1 <- dst_tp1 <- ds.test <- NULL}
+
+# Compiled data at time t 
+ds.all <- rbind(ds,ds.test)
+sub.ds[[i]] <- ds
+sub.ds.tp1[[i]] <- ds_tp1
+sub.ds.all[[i]] <- ds.all
+
+}
+
+sub.ds[[1]]
+sub.ds.all[[1]]
+sub.ds.tp1[[1]]
+
+
+sub[[1]] %>% 
+  group_by(region) %>% 
+  mutate(a1_scale = scale(a1))
+  
+```
+
+
+# converting sub.ds into matrix for later use
+```{r}
+
+sub.matrix <- lapply(sub.ds, as.matrix)
+
+```
+
+
+#----- Step 2. Run MDR-Smap
+
+# Univariate simplex projection to obtain optimal E
+
+Result of optimal E selected by rmse: 
+[[1]]
+[1] 5 5 6 6 6 6 5
+
+[[2]]
+[1] 6 5 6 6 6 3 4
+
+[[3]]
+[1] 4 5 5 6 6 6 2
+```{r}
+
+Emax <- 6 # here I use Emax = 6 instead of 10 
+cri <- 'rmse' # model selection 
+Ed_sub_list <- list()
+Ed_sub_list <- vector(mode='list', length=3) #length: number of list
+forecast_sub_list <- list()
+forecast_sub_list <- vector(mode = 'list', length = 3) #length: number of list
+
+for(j in 1:length(sub.ds)){
+  for(i in 1:ncol(sub.ds[[1]])){
+    spx.i <- simplex(sub.ds[[j]][,i],E=2:Emax)
+    Ed_sub_list[[j]][i] <- spx.i[which.min(spx.i[,cri])[1],'E']
+    forecast_sub_list[[j]][i] <- spx.i[which.min(spx.i[,cri])[1],'rho']
+    }}
+  
+Ed_sub_list # The optimal embedding dimension for each variable
+
+forecast_sub_list # Forecast skills for each variable based on simplex projection
+
+```
+
+
+# modify function <ccm.fast.demo> to <ccm.fast.demo.seq.1>
+
+In Demo_MDR_function.R, the ccm <ccm.fast.demo> function is set to increase the library size in increments of 10. Since the time series used in this study contains only 40 data points, a smaller increment is more appropriate. We modified the function to increase the library size by 1 here. 
+
+Specifically, 
+lib.s <- c(seq(10,nrow(ds),10),nrow(ds)) is change to 
+lib.s <- c(seq(10,nrow(ds),1),nrow(ds)) 
+
+```{r}
+
+ccm.fast.demo.seq.1 <- function(ds,Epair=T,cri='rmse',Emax=10){
+  if(cri=='rho'){jfun <- match.fun('which.max')}else{jfun <- match.fun('which.min')}
+  ds <- as.matrix(apply(ds,2,scale))
+  np <- nrow(ds) # time series length
+  ns <- ncol(ds) # number of nodes
+  #lib.s <- c(seq(10,nrow(ds),10),nrow(ds)) # sequence of library size
+  lib.s <- c(seq(10,nrow(ds),1),nrow(ds))
+  crirho <- qt(0.95,np-1)/(np-2+qt(0.95,np-1)^2) # critical values with alpha=0.05
+  ccm.rho <- ccm.sig <- matrix(0,ns,ns)
+  for(i in 1:ns){
+    t.begin <- proc.time()
+    for(j in 1:ns){
+      # select the optimal E for CCM based on hindcast at time= t-1 (tp=-1)
+      ccm.E <- NULL  
+      for(E.t in 2:Emax){
+        ccm.E <- rbind(ccm.E,ccm(cbind(x=ds[,i],y=ds[,j]), E = E.t, tp=-1,
+                              lib_column = "x", target_column = "y", 
+                              lib_sizes = nrow(ds),  random_libs =F))
+      }
+      Eop <- ccm.E[jfun(ccm.E[,cri]),'E'] # The optimal E for the cross-mapping from node i to node j 
+      
+      
+      # Perform CCM at time t (tp=0)      
+      ccm.out <- ccm(cbind(x=ds[,i],y=ds[,j]), E = Eop, tp=0, 
+                  lib_column = "x", target_column = "y", 
+                  lib_sizes = lib.s,  random_libs =F)
+      # aggregate the results with respect to each library size
+      ccm.seq <- aggregate(ccm.out[,'rho'],list(ccm.out[,'lib_size']),mean,na.rm=T)
+      ccm.seq <- ccm.seq[!(is.na(ccm.seq[,2])|is.infinite(ccm.seq[,2])),]
+      ccm.seq[ccm.seq[,2]<0,2] <- 0
+      termrho <- ccm.seq[nrow(ccm.seq),2]  # rho at the maximal library size (terminal rho)
+      if(nrow(ccm.seq)>=3){
+        kend <- MannKendall(ccm.seq[,2]);  # Kendall's tau test for mononotic increase
+        # Causation is significant only if both (1) Kendall's tau and (2) terminal rho are significantly larger than zero
+        ccm.sig[i,j] <- (kend$tau[1]>0)*(kend$sl[1]<0.05)*(termrho>crirho) # ccm.sig records the significance of each CCM
+      }else{ccm.sig[i,j] <- 0}
+      ccm.rho[i,j] <- termrho                                              # ccm.rho records the terminal rho
+    }#end of j
+    time.used <- proc.time() - t.begin 
+    cat("variable", i, "ccm completed:", time.used[3],"sec\n")
+  }#end of i
+  return(list(ccm.rho=ccm.rho,ccm.sig=ccm.sig))  
+}
+
+```
+
+
+# apply function <ccm.fast.demo.seq.1> to find causal variables
+
+```{r, message = F}
+
+file.name.sig <- paste0(dr, sep = "/","output/out_sub_sig.csv")
+
+file.name.rho <- paste0(dr, sep = "/","output/out_sub_rho.csv")
+
+
+Emax = 6
+cri = 'rmse'
+
+do.CCM <- T 
+
+ccm.sig <- list()
+ccm.rho <- list()
+
+
+for (i in 1:length(sub.ds)){
+
+if(do.CCM){ 
+  ccm.out <- ccm.fast.demo.seq.1(sub.ds[[i]],Epair=T,cri=cri,Emax=Emax)
+  ccm.sig[[i]] <- ccm.out[['ccm.sig']]
+  ccm.rho[[i]] <- ccm.out[['ccm.rho']]
+  if(SaveFile){
+  write.csv(ccm.sig, file =file.name.sig,row.names=F)
+  write.csv(ccm.rho,file = file.name.rho,row.names=F)
+  }
+} 
+  }
+
+
+ccm.sig[[3]]
+
+```
+
+
+# perform multiview embedding analysis for each node
+
+\# ccm.rho= matrix of CCM terminal rho \# ccm.sig= matrix recoding the significance of CCM between each node pair \# Ed= the optimal embedding dimension for each variable \# max_lag = the maximal time lag included in multiview embedding \# kmax= The maximal number for generating multiview SSR \# kn= Select the kn best multiview SSR \# Emax=maximal embedding dimension
+
+It takes around 20 minutes to run this chunk.
+
+```{r, message = FALSE}
+
+# Perform multiview embedding analysis for each node
+
+elese_lag <- list()
+elese_lag <- vector(mode='list', length=3) # length = number of list
+
+do.multiview <- T 
+
+for (i in 1:length(sub.matrix)){
+
+  elese_lag [[i]] <- esim.lag.demo(sub.matrix[[i]],
+                             ccm.rho[[i]],ccm.sig[[i]],Ed_sub_list[[i]],
+                             kmax=10000,kn=100,max_lag=3, Emax=Emax)
+  
+  }
+
+
+# check
+elese_lag[[3]]
+elese <- elese_lag # fit parameter name for next chunk
+elese[[3]]
+
+# save elese as list as a rds file
+
+elese.file.path <- paste0(dr, sep = "/","output/sub_elese.rds")
+
+saveRDS(elese, file = elese.file.path)
+
+```
+
+
+# compute of multiview distance
+
+need to first run this function <mvdist.demo> in <Demo_MDR_funciton.R>, then run the following code.
+
+```{r}
+
+# read <elese> 
+elese <- readRDS(file = elese.file.path)
+elese
+
+#1
+dmatrix.mv.list <- list()
+dmatrix.mv.list <- vector(mode='list', length=3)
+
+for (i in 1:length(sub.matrix)){
+dmatrix.mv.list[[i]] <- mvdist.demo(sub.ds[[i]],sub.ds.all[[i]],elese[[i]])}
+
+dmatrix.mv.list[[3]]
+
+#2 
+dmatrix.train.mvx.list <- list()
+dmatrix.train.mvx.list <- vector(mode='list', length=3)
+
+for (i in 1:length(sub.matrix)){
+  dmatrix.train.mvx.list[[i]] <- dmatrix.mv.list[[i]][['dmatrix.train.mvx']]
+} 
+
+
+#3 
+dmatrix.test.mvx.list <- list()
+dmatrix.test.mvx.list <- vector(mode='list', length=3)
+
+for (i in 1:length(sub.matrix)){
+  dmatrix.test.mvx.list[[i]] <- dmatrix.mv.list[[i]][['dmatrix.test.mvx']]
+  
+}
+
+
+# save dmatrix.train.mvx.list
+dmatrix.train.mvx.list.file.path <- paste0(dr, sep = "/","output/sub.dmatrix.train.mvx.list.rds")
+
+saveRDS(dmatrix.train.mvx.list, 
+        file = dmatrix.train.mvx.list.file.path )
+
+
+# save dmatrix.test.mvx.list
+dmatrix.test.mvx.list.file.path <- paste0(dr, sep = "/","output/sub.dmatrix.test.mvx.list.rds")
+
+saveRDS(dmatrix.mv.list, file = dmatrix.test.mvx.list.file.path)
+
+
+```
+
+
+# leave-one-out cross validation
+
+```{r}
+
+# read dmatrix.test.mvx.list
+
+dmatrix.mv.list <- 
+  readRDS(file = dmatrix.test.mvx.list.file.path)
+
+dmatrix.train.mvx.list <-
+  readRDS(file = dmatrix.train.mvx.list.file.path)
+  
+
+######## Leave-one-out cross-validation for finding the optimal parameters for MDR S-map analysis
+
+do.MDR.CV <- T
+
+cv.unit <- 0.1
+alpha.so <- seq(0, 1, cv.unit);            # Sequence of alpha
+sub.da <- 1                              # Divide the computation job into five parts 
+afsp <- eqsplit(1:length(alpha.so),sub.da) # Divide the parameter space based on alpha parameter
+alf <- 1                                  # Run CV in the first parameter subset 
+
+
+# Cross-validation of MDR analysis    
+cv.ind.list <- list()
+cv.ind.list <- vector(mode='list', length=3)
+
+
+for (i in 1:length(sub.matrix)){
+
+  alpha.s <- alpha.so[afsp[alf,1]:afsp[alf,2]] # Subset parameter pace
+  cv.ind.list[[i]] <- cv.MDR.demo(ds = sub.ds[[i]],ds_tp = sub.ds.tp1[[i]],
+                    dmatrix.list=dmatrix.train.mvx.list[[i]], parall=T, ncore=10, keep_intra=T,alpha.seq=alpha.s)}
+
+
+# save cv.ind.list
+cv.ind.list.file.path <- paste0(dr, sep = "/","output/sub.cv.ind.list.rds")
+
+saveRDS(cv.ind.list, file = cv.ind.list.file.path)
+
+```
+
+
+# compiled the CV results tested under different parts of parameter space
+
+```{r}
+
+# read cv.ind.list
+cv.ind.list <- readRDS(file = cv.ind.list.file.path)
+
+
+# run
+paracv.demo.list <- list()
+paracv.demo.list  <- vector(mode='list', length=3)
+
+for (i in 1:length(sub.matrix)){
+  paracv.demo.list[[i]] <- secv.demo(cv.ind.list[[i]])
+  }
+
+paracv.demo.list[[1]]
+paracv.demo.list[[2]]
+
+
+# save paracv.demo.list
+paracv.demo.list.file.path <- paste0(dr, sep = "/","output/sub.paracv.demo.list.rds")
+
+saveRDS(paracv.demo.list, 
+        file = paracv.demo.list.file.path)
+
+
+```
+
+
+# fitting MDR S-map based on the parameters selected by CV
+# save jacobian file <sub.jcof.csv>
+                   
+```{r}
+
+# read paracv.demo.list
+paracv.demo.list <- 
+  readRDS(file = paracv.demo.list.file.path)
+
+
+# run
+do.MDR <- T
+cv.unit <- 0.1                           
+ptype <- 'aenet'     # enet:elastic-net or msaenet: adaptive elastic-net
+
+# Select the optimal parameter set with the minimal MSE
+
+# Fitting the MDR S-map
+smap.demo.list <- list()
+smap.demo.list <- vector(mode='list', length=3)
+
+nr.out.list <- list()
+nr.out.list <- vector(mode='list', length=3)
+
+jcof.list <- list()
+jcof.list <- vector(mode='list', length=3)
+
+for (i in 1:length(sub.matrix)){
+smap.demo.list[[i]] <-
+  MDRsmap.demo(paracv=paracv.demo.list[[i]],
+               ptype=ptype,
+               keep_intra=T,
+               out.sample=F,
+               ds = sub.ds[[i]],
+               ds_tp1 = sub.ds.tp1[[i]],
+               ds.test=NULL,dst_tp1=NULL,
+               dmatrix.list =
+                 dmatrix.train.mvx.list[[i]],     
+               dmatrix.test.list=
+                 dmatrix.test.mvx.list[[i]])
+  
+  # Save forecast skills
+  nr.out.list[[i]] <- smap.demo.list[[i]][['nr.out']]
+  # save jacobian
+  jcof.list[[i]] <- smap.demo.list[[i]][['jcof']]
+  }
+  
+
+# save nr.out.list 
+nr.out.list.file.path <- paste0(dr, sep = "/","output/sub.nr.out.list.rds")
+
+saveRDS(nr.out.list, 
+        file = nr.out.list.file.path)
+
+# save jcof.list
+jcof.list.file.path <- paste0(dr, sep = "/","output/sub.jcof.list.rds")
+
+saveRDS(jcof.list, 
+        file = jcof.list.file.path)
+
+
+####-----unlist nr.out.list & jcof.list & save as csv
+
+#unlist nr.out.list to tibble <sub.nr.out>
+sub.nr.out.tibble <- do.call(rbind, nr.out.list)
+sub.nr.out.tibble <- as.tibble(sub.nr.out.tibble)
+sub.nr.out.tibble <- sub.nr.out.tibble %>% 
+  dplyr::select(- 'In_sample') %>% 
+  mutate(subarea = rep(1:3, each = 7)) %>% 
+  mutate(age = rep(1:7, times =3)) %>% 
+  relocate(subarea, .before = theta) %>% 
+  relocate(age, .after = subarea)
+  
+
+# unlist jcof.list to tibble <sub.jcof>
+sub.jcof.tibble <- do.call(rbind, jcof.list)
+sub.jcof.tibble  <- as.tibble(sub.jcof.tibble )
+sub.jcof.tibble  <- sub.jcof.tibble %>% 
+  dplyr::select(- 'Insample') %>% 
+  mutate(subarea = rep(1:3, each = 287)) %>% 
+  relocate(subarea, .before = time)
+  
+
+# save <sub.nr.out.tibble> as csv
+sub.nr.out.csv.file.path <- paste0(dr, sep = "/","output/sub.nr.out.csv")
+
+write.csv(sub.nr.out.tibble, 
+          file =sub.nr.out.csv.file.path,row.names=F)
+
+# save <sub.jcof.tibble> as csv
+sub.jcof.csv.file.path <- paste0(dr, sep = "/","output/sub.jcof.csv")
+
+write.csv(sub.jcof.tibble, 
+          file =sub.jcof.csv.file.path,row.names=F)
+
+
+```
+

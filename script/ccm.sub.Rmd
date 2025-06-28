@@ -1,0 +1,1471 @@
+---
+title: "ccm_sub"
+output: html_document
+date: "2025-01-25"
+editor_options: 
+  chunk_output_type: inline
+---
+
+This script runs ccm to detect causal relationships between abundance/dynamical stability and fishing/temperature. 
+
+
+# set directory
+
+```{r}
+
+dr <- "/Users/hsiaohang.tao/Dropbox/a_Chang_MDR/Demo_R_Code_MDR_S-MAP/mc_subpopulation"
+
+```
+
+
+# load packages
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+library("tidyverse")
+library("purrr")
+library("mapplots")
+library("ggplot2")
+library("gridExtra")
+library("igraph")
+library(igraphdata)
+library("ggplot2")
+library(grid)
+library(cowplot)
+library(ggtext)
+library(zoo)
+library(readxl)
+library(vegan)
+library(rEDM) 
+library(doParallel)
+library(parallel)
+library(foreach)
+library(Kendall)
+library(MASS)
+library(dplyr)
+library(glmnet)
+
+```
+
+
+# read data
+
+```{r}
+
+#read stability
+file.name <- paste0(dr, sep = "/","output/sta.dd.sub.csv")
+sta.dd.sub <- read.csv(file.name, header = T)
+
+# read abundance
+file.name <- paste0(dr, sep = "/","data/raw_data/subpopulation_data.xlsx")
+dd.sub <- read_excel(file.name)
+
+# read fishing
+file.name <- paste0(dr, sep = "/","data/driver_data/fishing_mortality_sub.xlsx")
+fishing.sub <- read_excel(file.name)
+
+# read temp
+file.name <- paste0(dr, sep = "/","data/driver_data/temp.ctd.csv")
+temp.ctd <- read.csv(file.name, header = T)
+
+```
+
+
+# set theme_specific [theme_s]
+```{r}
+
+theme_s <- scale_x_continuous(
+  breaks = seq(1983, 2024, by = 10),
+  limits = c(1983, 2024))
+
+```
+
+
+#----- normalise & bind variables
+
+## normalise variables
+
+```{r}
+
+# prepare abundance column
+dd.sub.var <- dd.sub %>% 
+  # keep only total abundance
+  dplyr::select(region, year, total) %>%
+  rename(sub = region,
+         abundance = total) %>%
+  group_by(sub) %>% 
+  mutate(abundance_scale = scale(abundance))
+  
+
+
+# prepare stability column
+sta.sub.var <- sta.dd.sub %>% 
+  dplyr::select(-X) %>% 
+  rename('year' = 'Year') %>% 
+  rename(sub = subpopulation,
+         stability = Abs.dev) %>% 
+  # normalise data
+  # @20250312 added group_by(sub) to scale within each sub
+  group_by(sub) %>% 
+  mutate(stability_scale = scale(stability)) 
+  
+
+# prepare fishing column
+fishing.sub.var <- fishing.sub %>%
+  mutate_at('fbar_2_4', as.numeric) %>% 
+  rename(sub = region,
+         fishing24 = fbar_2_4) %>%
+ # @20250312 added group_by(sub) to scale within each sub
+  group_by(sub) %>% 
+  mutate(fishing24_scale = scale(fishing24))
+
+
+# prepare temp.ctd column
+temp.sub.var <- temp.ctd %>%
+  rename(sub = region,
+         temp_ctd = Mean_temp,
+         year = Year) %>%
+  # @20250312 added group_by(sub) to scale within each sub
+  group_by(sub) %>% 
+  mutate(temp_ctd_scale = scale(temp_ctd)) %>% 
+  dplyr::select(-X)
+
+```  
+
+
+## bind driver as tibble [driver.sub] & matrix [driver.eigen.mat] 
+
+use inner_join to automatically trim years when all variables are present
+
+[[1]] northwestern
+[[2]] southern
+[[3]] viking
+
+All scaled variables:
+0. dd.sub.var
+1. sta.sub.var
+2. fishing.sub.var
+3. temp.sub.var
+
+```{r}
+
+# create [driver.sub] 
+
+#1 join abu & sta
+driver.sub <- inner_join(dd.sub.var, sta.sub.var, 
+                         by = c('year','sub'))
+
+#1 join sta & fishing
+driver.sub <- inner_join(driver.sub, fishing.sub.var, 
+                         by = c('year','sub'))
+
+
+#2 join temp.ctd
+driver.sub <- inner_join(driver.sub, temp.sub.var, 
+                         by = c('year','sub'))
+
+# create [driver.sub.list]: removed year, sub, and split by sub
+
+driver.sub.mat <- driver.sub %>% 
+  dplyr::select(! "year") %>% 
+  group_by(sub)
+  
+driver.sub.list <- group_split(driver.sub.mat)
+
+driver.sub.list <- driver.sub.list %>% 
+  # remove first sub column for ccm
+  map(subset,select=-c(1)) 
+
+```
+
+
+#----- plot variables
+
+## plot fishing mortality over time
+
+Fmsy from ICES 2024 report (p196):
+northwestern 0.193
+southern 0.231
+viking 0.186
+
+```{r}
+
+# add Fmsy 
+fmsy <- tibble(
+  sub = c("northwestern", "southern", "viking"), 
+  fmsy = c(0.193, 0.231,0.186),
+  fmsy_label = c('Fmsy = 0.193', 
+                'Fmsy = 0.231', 'Fmsy = 0.186'))
+
+# plot fishing <fishing.plot.sub>
+fishing.plot.sub <- ggplot(driver.sub)+ 
+  geom_line(aes(x = year, y = fishing24))+
+  xlab("Year")+
+  ylab("Fishing \nmortality \nage 2-4")+
+   facet_wrap(vars(sub))+
+  theme_bw()+
+  theme_s+
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        legend.position = c(0.9, 0.7),
+        axis.title.y = element_text(angle = 0, vjust = 0.5))+
+  geom_hline(data = fmsy, aes(yintercept = fmsy),
+             linetype = "dashed")+
+  geom_text(data = fmsy, aes(c(2003,2003,2003),
+                             fmsy,label = fmsy_label, 
+                             vjust = c(-0.5,-0.6,-0.4)), 
+            size = 3)
+  
+
+fishing.plot.sub
+```
+
+## plot temperature 
+
+```{r}
+
+(bt.plot <- ggplot(driver.sub)+ 
+  geom_line(aes(x = year, y = temp_ctd))+
+  xlab("Year")+
+  ylab("Mean bottom \ntemperature 0-200m")+
+   facet_wrap(vars(sub))+
+  theme_bw()+
+  theme_s+
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        legend.position = c(0.9, 0.7),
+        axis.title.y = element_text(angle = 0, vjust = 0.5)))
+ 
+```
+
+
+## 4 plots stability/abundance ~ fishing24/temp_ctd
+
+[[1]] northwestern
+[[2]] southern
+[[3]] viking
+
+```{r}
+
+# abundance~fishing
+plot.abu.fis <- driver.sub %>% 
+  ggplot(aes(x = fishing24, y = abundance/1000, color = sub, shape = sub))+ 
+  geom_point()+
+  scale_shape_manual(values=c(16, 16, 1))+
+  geom_smooth(se = FALSE)+
+  xlab("Fishing mortality age 2-4")+
+  ylab("Abundance \n(thousand)")+
+  theme_bw()+
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        legend.position = c(0.2, 0.9))
+
+
+# stability~fishing
+plot.sta.fis <- driver.sub %>% 
+  ggplot(aes(x = fishing24, y = stability, color = sub,
+             shape = sub))+ 
+  geom_point()+
+  scale_shape_manual(values=c(1, 16, 1))+
+  geom_smooth(se = FALSE)+
+  xlab("Fishing mortality age 2-4")+
+  ylab("Stability")+
+  theme_bw()+
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        legend.position="none")
+
+
+# abundance ~ temp
+plot.abu.tem <- driver.sub %>% 
+  ggplot(aes(x = temp_ctd, y = abundance/1000, color = sub,
+             shape = sub))+ 
+  geom_point()+
+  scale_shape_manual(values=c(1, 1, 1))+
+  geom_smooth(se = FALSE)+
+  xlab("Mean bottom temperature 0-200m")+
+  ylab("Abundance \n(thousand)")+
+  theme_bw()+
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        legend.position="none")
+
+
+# stability ~ temp
+plot.sta.tem <- driver.sub %>% 
+  ggplot(aes(x = temp_ctd, y = stability, color = sub,
+             shape = sub))+ 
+  geom_point()+
+  scale_shape_manual(values=c(1, 1, 1))+
+  geom_smooth(se = FALSE)+
+  xlab("Mean bottom temperature 0-200m")+
+  ylab("Stability")+
+  theme_bw()+
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        legend.position="none")
+
+
+# bind plot
+grid.arrange(plot.abu.fis,plot.abu.tem,
+             plot.sta.fis,plot.sta.tem, ncol = 2)
+
+```
+
+
+## plot stability/abundance ~ fishing24/temp_ctd for each subpopulation
+
+[[1]] northwestern
+[[2]] southern
+[[3]] viking
+
+```{r}
+
+#common plot code
+theme_common <- 
+  theme_bw()+
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        legend.position = 'right') 
+  
+
+# abundance~fishing
+(plot.abu.fis <- driver.sub %>% 
+  ggplot(aes(x = fishing24, y = abundance/1000, 
+             alpha = year))+ 
+     geom_point()+
+  facet_wrap(vars(sub))+
+  xlab("Fishing mortality age 2-4")+
+  ylab("Abundance \n(thousand)")+
+    theme_common)+
+  geom_smooth()
+
+
+# stability~fishing
+(plot.sta.fis <- driver.sub %>% 
+  ggplot(aes(x = fishing24, y = stability, alpha = year))+ 
+  geom_point()+ facet_wrap(vars(sub))+
+  xlab("Fishing mortality age 2-4")+
+  ylab("Stability")+
+    theme_common)
+
+
+# abundance ~ temp
+(plot.abu.tem <- driver.sub %>% 
+  ggplot(aes(x = temp_ctd, y = abundance/1000, alpha = year))+ 
+  geom_point()+ facet_wrap(vars(sub))+
+  xlab("Mean bottom temperature 0-200m")+
+  ylab("Abundance \n(thousand)")+
+  theme_common)+
+  geom_smooth()
+
+
+# stability ~ temp
+(plot.sta.tem <- driver.sub %>% 
+  ggplot(aes(x = temp_ctd, y = stability, alpha = year))+ 
+  geom_point()+ facet_wrap(vars(sub))+
+  xlab("Mean bottom temperature 0-200m")+
+  ylab("Stability")+
+  theme_common)
+
+
+# bind plot
+grid.arrange(plot.abu.fis,plot.abu.tem,
+             plot.sta.fis,plot.sta.tem, ncol = 1)
+
+```
+
+## abundance/stability ~ fishing with dual y axis
+```{r}
+
+# create theme_dual
+theme_dual <- 
+    theme_bw()+
+  theme(axis.title.y = element_text(angle = 0, vjust = 0.5))+
+      theme(
+        axis.line.y.left = element_line(color = "#56B4E9"), 
+        axis.ticks.y.left  = element_line(color = "#56B4E9"),
+        axis.text.y.left = element_text(color = "#56B4E9"), 
+        axis.title.y.left = element_text(color = "#56B4E9"))+
+    theme(axis.line.y.right = element_line(color = "#E69F00"), 
+        axis.ticks.y.right = element_line(color = "#E69F00"),
+        axis.text.y.right = element_text(color = "#E69F00"), 
+        axis.title.y.right = element_text(color = "#E69F00"))+
+    theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        legend.position = 'right') 
+
+coeff <- 1000
+
+(plot.abu.fis <- driver.sub %>% 
+  ggplot(aes(x = fishing24))+
+        geom_point(aes(y = abundance/1000, alpha = year), col = '#56B4E9')+
+     geom_smooth(aes(y = abundance/1000, alpha = year), col = '#56B4E9')+
+   geom_point(aes(y = stability*coeff, alpha = year), col = '#E69F00')+
+    geom_smooth(aes(y = stability*coeff, alpha = year), col = '#E69F00')+
+   scale_y_continuous(
+    # Features of the first axis
+    name = "Abundance \n(thousand)",
+    # Add a second axis and specify its features
+    sec.axis = sec_axis(~./coeff, name="Stability")) +
+  facet_wrap(vars(sub))+
+  xlab("Fishing mortality age 2-4")+
+  ylab("Abundance \n(thousand)")+
+    theme_dual)
+
+```
+
+## abundance/stability ~ temp with dual y axis 
+```{r}
+
+coeff <- 500
+
+(plot.abu.temp <- driver.sub %>% 
+  ggplot(aes(x = temp_ctd))+
+        geom_point(aes(y = abundance/1000, alpha = year), col = '#56B4E9')+
+    geom_smooth(aes(y = abundance/1000, alpha = year), col = '#56B4E9')+
+   geom_point(aes(y = stability*coeff, alpha = year), col = '#E69F00')+
+    geom_smooth(aes(y = stability*coeff, alpha = year), col = '#E69F00')+
+   scale_y_continuous(
+    # Features of the first axis
+    name = "Abundance \n(thousand)",
+    # Add a second axis and specify its features
+    sec.axis = sec_axis(~./coeff, name="Stability")) +
+  facet_wrap(vars(sub))+
+  xlab("Mean bottom temperature 0-200m")+
+  ylab("Abundance \n(thousand)")+
+    theme_dual)
+
+```
+
+
+
+#----- run ccm step-by-step and validate the significance
+
+## function to run simplex for determining optimal E 
+
+For stability: <e.no> <e.so> <e.vi> 
+northwestern: optimal = 9 (rmse) or 9(rho)
+southern: optimal = 5 (rmse) or 5(rho)
+viking: optimal = 2 (rmse) or 2 (rho)
+
+For abundance: <e.no.a> <e.so.a> <e.vi.a> 
+northwestern: optimal = 5 (rmse) or 5(rho)
+southern: optimal = 6 (rmse) or 4 (rho)
+viking: optimal = 10 (rmse) or 3 (rho)
+
+```{r}
+
+# function to find optimal E
+fun_E <- function(SUB, VAR){
+  dd <- driver.sub %>%
+    ungroup() %>% 
+  filter(sub == SUB) %>% 
+  dplyr::select(year,all_of(VAR))
+  
+  dd <- as.data.frame(dd)
+  
+  spx <- simplex(dd, E = 2:10) 
+  rmse <- spx[which.min(spx[,'rmse'])[1],'E'] # 2
+  rho <- spx[which.max(spx[,'rho'])[1],'E'] # 2
+  out <- c(rmse, rho)
+  out
+}
+
+
+# check E for stability
+(e.no <- fun_E('northwestern', VAR = 'stability_scale'))
+(e.so <- fun_E('southern', VAR = 'stability_scale'))
+(e.vi <- fun_E('viking', VAR = 'stability_scale'))
+
+
+# check E for abundance 
+(e.no.a <- fun_E('northwestern', VAR = 'abundance_scale')) # 5 5 
+(e.so.a <- fun_E('southern', VAR = 'abundance_scale')) # 6 4
+(e.vi.a <- fun_E('viking', VAR = 'abundance_scale')) # 10 3
+
+
+```
+
+
+## function to run ccm
+
+```{r}
+
+# function to run ccm <function_ccm>
+function_ccm <- function(SUB, LIB, TARGET, OPTIMAL_E){
+  
+dd <- driver.sub %>% 
+  filter(sub == SUB) %>% 
+  ungroup() 
+  
+ccm.out <- ccm(dd, E = OPTIMAL_E, tp = 0, 
+               lib_column = LIB,
+    target_column = TARGET, 
+    lib_sizes = seq(10, 37,by = 1), 
+    num_samples = 5000, 
+    replace = T)
+
+ccm.out <- as.tibble(ccm.out)
+
+ccm.out <- ccm.out %>%
+  mutate(boot_num = rep(1:5000, times = 28)) %>% 
+  mutate_at('boot_num',as.factor) %>%
+  group_by(lib_size) %>% 
+  summarise(median_rho = median(rho),
+            quantile_rho_5 = quantile(rho, 0.05),
+            quantile_rho_95 = quantile(rho, 0.95)) %>% 
+  mutate(sub = SUB)
+
+ccm.out
+}
+
+```
+
+
+## function to extract kendall tau and p value
+
+This test returns a value τ that is positive if the forecasting skill increases with library size and negative if the forecasting skill decreases with library size. It also provides a p-value for the significance of the monotonic trend. So we check if τ is positive and if the p-value is less than 0.05.
+
+```{r}
+
+fun_kendall <- function(DATA){
+  d1 <- DATA %>% 
+  pull(median_rho)
+  
+  MannKendall(d1)
+}
+
+```
+
+
+##----- ccm stability ~ fishing
+
+## run ccm stability ~ fishing, output in <ccm.ori>
+
+```{r}
+
+# run ccm for stability
+
+(ccm.no <- function_ccm(SUB = 'northwestern',
+                       OPTIMAL_E = e.no[2], 
+                       LIB = 'stability', 
+                       TARGET = 'fishing24'))
+
+(ccm.so <- function_ccm(SUB = 'southern',
+                       OPTIMAL_E = e.so[2],
+                       LIB = 'stability', 
+                       TARGET = 'fishing24'))
+
+(ccm.vi <- function_ccm(SUB = 'viking',
+                       OPTIMAL_E = e.vi[2],
+                       LIB = 'stability', 
+                       TARGET = 'fishing24'))
+
+
+# bind 3 subpoplations into one tibble <plot.ori>
+
+ccm.ori <- bind_rows(ccm.no,ccm.so,ccm.vi)
+ccm.ori <- ccm.ori %>% 
+  relocate(sub,.before = 'lib_size')
+
+```
+
+
+## Mann-Kendall test, output in <ken.no> <ken.so> <ken.vi>
+
+no: tau = -0.529, 2-sided pvalue =8.4401e-05
+so: tau = 1, 2-sided pvalue =< 2.22e-16
+vi: tau = tau = 0.958, 2-sided pvalue =< 2.22e-16
+
+```{r}
+
+(ken.no <- fun_kendall(ccm.no))
+(ken.so <- fun_kendall(ccm.so))
+(ken.vi <- fun_kendall(ccm.vi))
+
+```
+
+
+## create randomised time series
+```{r}
+
+## random shuffle row-wise (keep correspondence of x & y) 
+
+fun_random <- function(SUB, DRIVER){
+  out <- list()
+  
+  dd <- driver.sub %>% filter(sub == SUB) %>% 
+  dplyr::select(year, stability, fishing24) 
+  
+  for (i in 1:5000){
+    out[[i]]<- dd %>% slice(sample(1:n()))
+  }
+  out
+}
+
+random.list.no <- fun_random('northwestern')
+random.list.so <- fun_random('southern')
+random.list.vi <- fun_random('viking')
+
+```
+
+## run ccm for random time series and save outoput in <ccm.ran> as well as 'output/ccm.ran.5000.csv'
+
+```{r}
+
+# function
+fun_ccm_random <- function(dd, OPTIMAL_E, SUB){
+  
+  out.list <- list()
+  
+  for (i in 1:length(dd)){
+  ccm.out <- ccm(dd[[i]], E = 5, tp = 0, 
+               lib_column = 'stability',
+               target_column = 'fishing24', 
+               lib_sizes = seq(10, 37,by = 1), 
+               # for each random time series 1 bootstrap
+               num_samples = 1, 
+               replace = T)
+  
+  ccm.out <- as.tibble(ccm.out)
+  
+  ccm.out <- ccm.out %>%
+  dplyr::select(lib_size, rho) %>% 
+  mutate(random_number = i) 
+  
+  out.list[[i]] <- ccm.out
+  
+  }
+  out.list <- bind_rows(out.list)
+  out.list <- out.list %>% 
+    mutate(sub = SUB)
+  }
+
+# run fun_ccm_random
+out.ccm.ran.no <- fun_ccm_random (random.list.no, e.no,
+                                  'northwestern')
+out.ccm.ran.so <- fun_ccm_random (random.list.so, e.so,
+                                  'southern')
+out.ccm.ran.vi <- fun_ccm_random (random.list.vi, e.vi,
+                                  'viking')
+
+# join 3 subpopulations into one tibble
+ccm.ran <- bind_rows(out.ccm.ran.no,out.ccm.ran.so,out.ccm.ran.vi )
+
+
+# save ccm.ran with output from 5000 random time series (before compiling to median)
+file.name <- paste0(dr, sep = "/","output/ccm_step_by_step/ccm.ran.5000.csv")
+sta.dd.sub <- write.csv(ccm.ran, file.name)
+
+
+# compute median and quantile into <plot.ran>
+ccm.ran <- ccm.ran %>% 
+  relocate(sub,.before = 'lib_size') %>% 
+  group_by(sub, lib_size) %>% 
+  summarise(median_rho_ran = median(rho),
+            quantile_rho_5_ran = quantile(rho, 0.05),
+            quantile_rho_95_ran = quantile(rho, 0.95))
+
+```
+
+
+## join ccm outputs from original and randomised time series 
+
+```{r}
+
+ccm.ori # tibble for ccm output from original time series
+ccm.ran # tibble for ccm ouptut from random time series
+
+dd.ori.ran <- inner_join(ccm.ori, ccm.ran, by = c('sub','lib_size'))
+
+# save dd.ori.ran
+file.name <- paste0(dr, sep = "/","output/ccm_step_by_step/ccm.ori.ran.csv")
+write.csv(dd.ori.ran, file.name)
+
+```
+
+
+## plot stability~fishing
+
+results of Kendall's test 
+no: tau = -0.529, 2-sided pvalue =8.4401e-05
+so: tau = 1, 2-sided pvalue =< 2.22e-16
+vi: tau = tau = 0.958, 2-sided pvalue =< 2.22e-16
+
+output as 3 x 9 
+
+```{r}
+
+## read data
+file.name <- paste0(dr, sep = "/","output/ccm_step_by_step/ccm.ori.ran.csv")
+dd.ori.ran <- read.csv(file.name)
+
+## create text for Kendall's result
+dat_text <- data.frame(
+  label = c("tau = -0.53, p < 0.05", 
+            "tau = 1, p < 0.05", 
+            "tau = 0.96, p < 0.05"),
+  sub   = c('northwestern', 'southern', 'viking')
+)
+
+(f1 <- ggplot(dd.ori.ran, aes(x = lib_size))+
+  geom_line(aes(y = median_rho),color = '#E69F00')+
+  geom_line(aes(y = quantile_rho_5),linetype = 'dashed',
+            color = '#E69F00')+
+  geom_line(aes(y = quantile_rho_95), linetype = 'dashed',
+            color = '#E69F00')+
+  geom_ribbon(aes(ymax=quantile_rho_95,
+                  ymin=quantile_rho_5), 
+              fill="#E69F00", alpha=0.25) +
+  geom_line(aes(y = median_rho_ran))+
+  geom_line(aes(y = quantile_rho_5_ran),
+            linetype = 'dashed')+
+  geom_line(aes(y = quantile_rho_95_ran), 
+            linetype = 'dashed')+
+  geom_ribbon(aes(ymax=quantile_rho_95_ran,
+                  ymin=quantile_rho_5_ran), 
+              fill="grey", alpha=0.25) +
+  facet_wrap(vars(sub))+
+   theme_bw()+
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        axis.title.y = element_text(angle = 0, vjust = 0.5))+
+  geom_text(data = dat_text,
+  mapping = aes(x = -Inf, y = -Inf, label = label),
+  hjust   = -0.1,
+  vjust   = c(-15,-0.5,-15))+
+  ylab('Effect of fishing \n on stability (rho)')+
+    xlab('Library size'))
+
+```
+
+
+## check significance of ccm 
+
+check if the forecasting skill from original time series is higher than the forecasting skill of the null model. For the same library size, we check if the median forecasting skill of the 5000 bootstraps on the original data is above the 95% quantile of the 5000 random shuffles for at least 90% of
+the library sizes.
+
+```{r}
+
+dd.ori.ran %>% 
+  # if median_rho is higher than quantile_95_ran = default 1
+  mutate(test_higher = 1) %>%
+  # if lower, 0
+  mutate(test_higher = 
+            replace(test_higher, median_rho < quantile_rho_95_ran, 0)) %>% 
+  group_by(sub) %>% 
+  summarise(number_library_size = n(),
+            sum_test_higher = sum(test_higher)) %>% 
+  # if at least 90% of library sizes pass median > quantile_95_ran = defalt 1
+  mutate(pass = 1) %>% 
+  mutate(pass = replace(pass, sum_test_higher < 0.9* number_library_size, 0))
+
+```
+
+
+##----- ccm stability ~ temp
+
+## run ccm stability ~ temp_ctd, output in <ccm.ori.t>
+
+```{r}
+
+# run ccm for stability
+(ccm.no.t <- function_ccm(SUB = 'northwestern',
+                       OPTIMAL_E = e.no[2], 
+                       LIB = 'stability', 
+                       TARGET = 'temp_ctd'))
+
+(ccm.so.t <- function_ccm(SUB = 'southern',
+                       OPTIMAL_E = e.so[2],
+                       LIB = 'stability', 
+                       TARGET = 'temp_ctd'))
+
+(ccm.vi.t <- function_ccm(SUB = 'viking',
+                       OPTIMAL_E = e.vi[2],
+                       LIB = 'stability', 
+                       TARGET = 'temp_ctd'))
+
+
+# bind 3 subpoplations into one tibble <plot.ori>
+ccm.ori.t <- bind_rows(ccm.no.t,ccm.so.t,ccm.vi.t)
+ccm.ori.t <- ccm.ori.t %>% 
+  relocate(sub,.before = 'lib_size')
+
+```
+
+
+## Mann-Kendall test 
+
+stability~temp_ctd
+no: tau = 0.746, 2-sided pvalue =< 2.22e-16
+so: tau = 0.989, 2-sided pvalue =< 2.22e-16
+vi: tau = 0.354, 2-sided pvalue =0.0085986
+
+```{r}
+
+(ken.no.t <- fun_kendall(ccm.no.t))
+(ken.so.t <- fun_kendall(ccm.so.t))
+(ken.vi.t <- fun_kendall(ccm.vi.t))
+
+```
+
+
+## create randomised time series
+```{r}
+
+## random shuffle row-wise (keep correspondence of x & y) 
+
+fun_random <- function(SUB){
+  out <- list()
+  
+  dd <- driver.sub %>% filter(sub == SUB) %>% 
+    # select temp_ctd as driver
+  dplyr::select(year, stability,temp_ctd) 
+  
+  for (i in 1:5000){
+    out[[i]]<- dd %>% slice(sample(1:n()))
+  }
+  out
+}
+
+random.list.no.t <- fun_random('northwestern')
+random.list.so.t <- fun_random('southern')
+random.list.vi.t <- fun_random('viking')
+
+```
+
+
+## run ccm for randomised time series 
+
+```{r}
+
+# function
+fun_ccm_random <- function(dd, OPTIMAL_E, SUB){
+  
+  out.list <- list()
+  
+  for (i in 1:length(dd)){
+  ccm.out <- ccm(dd[[i]], E = 5, tp = 0, 
+               lib_column = 'stability',
+               # target column = temp_ctd
+               target_column = 'temp_ctd', 
+               lib_sizes = seq(10, 37,by = 1), 
+               # for each random time series 1 bootstrap
+               num_samples = 1, 
+               replace = T)
+  
+  ccm.out <- as.tibble(ccm.out)
+  
+  ccm.out <- ccm.out %>%
+  dplyr::select(lib_size, rho) %>% 
+  mutate(random_number = i) 
+  
+  out.list[[i]] <- ccm.out
+  
+  }
+  out.list <- bind_rows(out.list)
+  out.list <- out.list %>% 
+    mutate(sub = SUB)
+  }
+
+# run fun_ccm_random
+out.ccm.ran.no.t <- fun_ccm_random (random.list.no.t,
+                                    e.no,
+                                  'northwestern')
+out.ccm.ran.so.t <- fun_ccm_random (random.list.so.t,
+                                    e.so,
+                                  'southern')
+out.ccm.ran.vi.t <- fun_ccm_random (random.list.vi.t,
+                                    e.vi,
+                                  'viking')
+
+# join 3 subpopulations into one tibble
+ccm.ran.t <- bind_rows(out.ccm.ran.no.t,
+                       out.ccm.ran.so.t,
+                       out.ccm.ran.vi.t )
+
+# save ccm.ran with output from 5000 random time series (before compiling to median)
+write.csv(ccm.ran.t,"/Users/hsiaohang.tao/Dropbox/a_Chang_MDR/Demo_R_Code_MDR_S-MAP/mc_subpopulation/output/ccm_step_by_step/ccm.ran.5000.temp.csv")
+
+
+# compute median and quantile into <plot.ran>
+ccm.ran.t <- ccm.ran.t %>% 
+  relocate(sub,.before = 'lib_size') %>% 
+  group_by(sub, lib_size) %>% 
+  summarise(median_rho_ran = median(rho),
+            quantile_rho_5_ran = quantile(rho, 0.05),
+            quantile_rho_95_ran = quantile(rho, 0.95))
+
+```
+
+## join ccm outputs from original and randomised time series 
+```{r}
+
+ccm.ori.t # tibble for ccm output from original time series
+ccm.ran.t # tibble for ccm ouptut from random time series
+
+dd.ori.ran.t <- inner_join(ccm.ori.t, ccm.ran.t, by = c('sub','lib_size'))
+
+# save dd.ori.ran
+write.csv(dd.ori.ran.t,"/Users/hsiaohang.tao/Dropbox/a_Chang_MDR/Demo_R_Code_MDR_S-MAP/mc_subpopulation/output/ccm_step_by_step/ccm.ori.ran.temp.csv")
+
+```
+
+
+## plot stability ~temp
+
+results of Kendall's test stability ~ temp_ctd
+no: tau = 0.746, 2-sided pvalue =< 2.22e-16
+so: tau = 0.989, 2-sided pvalue =< 2.22e-16
+vi: tau = 0.354, 2-sided pvalue =0.0085986
+
+```{r}
+
+# read dd.ori.ran
+dd.ori.ran.t <- read.csv("/Users/hsiaohang.tao/Dropbox/a_Chang_MDR/Demo_R_Code_MDR_S-MAP/mc_subpopulation/output/ccm_step_by_step/ccm.ori.ran.temp.csv")
+
+## create text for Kendall's result
+dat_text <- data.frame(
+  label = c("tau = 0.75, p < 0.05", 
+            "tau = 0.99, p < 0.05", 
+            "tau = 0.35, p < 0.05"),
+  sub   = c('northwestern', 'southern', 'viking')
+)
+
+
+(f2 <- ggplot(dd.ori.ran.t, aes(x = lib_size))+
+  geom_line(aes(y = median_rho),color = '#E69F00')+
+  geom_line(aes(y = quantile_rho_5),linetype = 'dashed',
+            color = '#E69F00')+
+  geom_line(aes(y = quantile_rho_95), linetype = 'dashed',
+            color = '#E69F00')+
+  geom_ribbon(aes(ymax=quantile_rho_95,
+                  ymin=quantile_rho_5), 
+              fill="#E69F00", alpha=0.25) +
+  geom_line(aes(y = median_rho_ran))+
+  geom_line(aes(y = quantile_rho_5_ran),
+            linetype = 'dashed')+
+  geom_line(aes(y = quantile_rho_95_ran), 
+            linetype = 'dashed')+
+  geom_ribbon(aes(ymax=quantile_rho_95_ran,
+                  ymin=quantile_rho_5_ran), 
+              fill="grey", alpha=0.25) +
+  ggtitle('')+
+  facet_wrap(vars(sub))+
+   theme_bw()+
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        axis.title.y = element_text(angle = 0, vjust = 0.5))+
+  geom_text(data = dat_text,
+  mapping = aes(x = -Inf, y = -Inf, label = label),
+  hjust   = -0.1,
+  vjust   = c(-15,-0.5,-0.5))+
+  ylab('Effect of temp. \n on stability (rho)')+
+    xlab('Library size'))
+
+```
+
+
+## check significance of ccm 
+
+```{r}
+
+dd.ori.ran.t %>% 
+  # if median_rho is higher than quantile_95_ran = default 1
+  mutate(test_higher = 1) %>%
+  # if lower, 0
+  mutate(test_higher = 
+            replace(test_higher, median_rho < quantile_rho_95_ran, 0)) %>% 
+  group_by(sub) %>% 
+  summarise(number_library_size = n(),
+            sum_test_higher = sum(test_higher)) %>% 
+  # if at least 90% of library sizes pass median > quantile_95_ran = defalt 1
+  mutate(pass = 1) %>% 
+  mutate(pass = replace(pass, sum_test_higher < 0.9* number_library_size, 0))
+
+```
+
+
+##----- ccm abundance ~ fishing
+
+## run ccm abundance ~ fishing, output in <ccm.ori.a>
+```{r}
+
+# run ccm for stability
+
+(ccm.no.a <- function_ccm(SUB = 'northwestern',
+                       OPTIMAL_E = e.no.a[2], 
+                       LIB = 'abundance_scale', 
+                       TARGET = 'fishing24_scale'))
+
+(ccm.so.a <- function_ccm(SUB = 'southern',
+                       OPTIMAL_E = e.so.a[2],
+                       LIB = 'abundance_scale', 
+                       TARGET = 'fishing24_scale'))
+
+(ccm.vi.a <- function_ccm(SUB = 'viking',
+                       OPTIMAL_E = e.vi.a[2],
+                       LIB = 'abundance_scale', 
+                       TARGET = 'fishing24_scale'))
+
+
+# bind 3 subpoplations into one tibble <plot.ori>
+ccm.ori.a <- bind_rows(ccm.no.a,ccm.so.a,ccm.vi.a)
+ccm.ori.a <- ccm.ori.a %>% 
+  relocate(sub,.before = 'lib_size')
+
+```
+
+
+## Mann-Kendall test 
+
+no: tau = 0.979, 2-sided pvalue =< 2.22e-16
+so: tau = 0.984, 2-sided pvalue =< 2.22e-16
+vi: tau = -0.979, 2-sided pvalue =3.096e-13
+
+```{r}
+
+(ken.no.a <- fun_kendall(ccm.no.a))
+(ken.so.a <- fun_kendall(ccm.so.a))
+(ken.vi.a <- fun_kendall(ccm.vi.a))
+
+```
+
+
+## create randomised time series
+
+```{r}
+
+## random shuffle row-wise (keep correspondence of x & y) 
+
+fun_random <- function(SUB, DRIVER){
+  out <- list()
+  
+  dd <- driver.sub %>% filter(sub == SUB) %>% 
+    # 20250415 change to year, abundnace_scale, fishing_scale
+  #dplyr::select(year, stability, fishing24) 
+    dplyr::select(year, abundance_scale, fishing24_scale) 
+    
+  for (i in 1:5000){
+    out[[i]]<- dd %>% slice(sample(1:n()))
+  }
+  out
+}
+
+random.list.no.a <- fun_random('northwestern')
+random.list.so.a <- fun_random('southern')
+random.list.vi.a <- fun_random('viking')
+
+```
+
+## run ccm for random time series 
+
+```{r}
+
+# function
+fun_ccm_random <- function(dd, OPTIMAL_E, SUB){
+  
+  out.list <- list()
+  
+  for (i in 1:length(dd)){
+  ccm.out <- ccm(dd[[i]], E = 5, tp = 0, 
+               lib_column = 'abundance_scale',
+               target_column = 'fishing24_scale', 
+               lib_sizes = seq(10, 37,by = 1), 
+               # for each random time series 1 bootstrap
+               num_samples = 1, 
+               replace = T)
+  
+  ccm.out <- as.tibble(ccm.out)
+  
+  ccm.out <- ccm.out %>%
+  dplyr::select(lib_size, rho) %>% 
+  mutate(random_number = i) 
+  
+  out.list[[i]] <- ccm.out
+  
+  }
+  out.list <- bind_rows(out.list)
+  out.list <- out.list %>% 
+    mutate(sub = SUB)
+  }
+
+# run fun_ccm_random
+out.ccm.ran.no.a <- fun_ccm_random (random.list.no.a, e.no.a,
+                                  'northwestern')
+out.ccm.ran.so.a <- fun_ccm_random (random.list.so.a, e.so.a,
+                                  'southern')
+out.ccm.ran.vi.a <- fun_ccm_random (random.list.vi.a, e.vi.a,
+                                  'viking')
+
+# join 3 subpopulations into one tibble
+ccm.ran.a <- bind_rows(out.ccm.ran.no.a,
+                       out.ccm.ran.so.a,
+                       out.ccm.ran.vi.a )
+
+# save ccm.ran with output from 5000 random time series (before compiling to median)
+write.csv(ccm.ran.a,"/Users/hsiaohang.tao/Dropbox/a_Chang_MDR/Demo_R_Code_MDR_S-MAP/mc_subpopulation/output/ccm_step_by_step/ccm.ran.5000.abu.fis.csv")
+
+
+# compute median and quantile into <plot.ran>
+ccm.ran.a <- ccm.ran.a %>% 
+  relocate(sub,.before = 'lib_size') %>% 
+  group_by(sub, lib_size) %>% 
+  summarise(median_rho_ran = median(rho),
+            quantile_rho_5_ran = quantile(rho, 0.05),
+            quantile_rho_95_ran = quantile(rho, 0.95))
+
+```
+
+## join ccm outputs from original and randomised time series 
+
+```{r}
+
+ccm.ori.a # tibble for ccm output from original time series
+ccm.ran.a # tibble for ccm ouptut from random time series
+
+dd.ori.ran.a <- inner_join(ccm.ori.a, ccm.ran.a, by = c('sub','lib_size'))
+
+# save dd.ori.ran
+write.csv(dd.ori.ran.a,"/Users/hsiaohang.tao/Dropbox/a_Chang_MDR/Demo_R_Code_MDR_S-MAP/mc_subpopulation/output/ccm_step_by_step/ccm.ori.ran.abu.fis.csv")
+
+
+```
+
+
+## plot abundance ~ fishing
+
+results of Kendall's test 
+no: tau = 0.979, 2-sided pvalue =< 2.22e-16
+so: tau = 0.984, 2-sided pvalue =< 2.22e-16
+vi: tau = -0.979, 2-sided pvalue =3.096e-13
+
+```{r}
+
+# read data
+dd.ori.ran.a <- read.csv("/Users/hsiaohang.tao/Dropbox/a_Chang_MDR/Demo_R_Code_MDR_S-MAP/mc_subpopulation/output/ccm_step_by_step/ccm.ori.ran.abu.fis.csv")
+
+## create text for Kendall's result
+dat_text <- data.frame(
+  label = c("tau = 0.98, p < 0.05", 
+            "tau = 0.98, p < 0.05", 
+            "tau = -0.98, p < 0.05"),
+  sub   = c('northwestern', 'southern', 'viking')
+)
+
+
+ggplot(dd.ori.ran.a, aes(x = lib_size))+
+  geom_line(aes(y = median_rho),color = '#56B4E9')+
+  geom_line(aes(y = quantile_rho_5),linetype = 'dashed',
+            color = '#56B4E9')+
+  geom_line(aes(y = quantile_rho_95), linetype = 'dashed',
+            color = '#56B4E9')+
+  geom_ribbon(aes(ymax=quantile_rho_95,
+                  ymin=quantile_rho_5), 
+              fill="#56B4E9", alpha=0.25) +
+  geom_line(aes(y = median_rho_ran))+
+  geom_line(aes(y = quantile_rho_5_ran),
+            linetype = 'dashed')+
+  geom_line(aes(y = quantile_rho_95_ran), 
+            linetype = 'dashed')+
+  geom_ribbon(aes(ymax=quantile_rho_95_ran,
+                  ymin=quantile_rho_5_ran), 
+              fill="grey", alpha=0.25) +
+  ggtitle('')+
+  facet_wrap(vars(sub))+
+   theme_bw()+
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        axis.title.y = element_text(angle = 0, vjust = 0.5))+
+  geom_text(data = dat_text,
+  mapping = aes(x = -Inf, y = -Inf, label = label),
+  hjust   = -0.1,
+  vjust   = c(-0.5,-0.5,-15))+
+    ylab('Effect of fishing \n on abundance (rho)')+
+    xlab('Library size')
+
+# output as 3 x 9 is good
+
+```
+
+
+
+## check significance of ccm 
+
+```{r}
+
+dd.ori.ran.a %>% 
+  # if median_rho is higher than quantile_95_ran = default 1
+  mutate(test_higher = 1) %>%
+  # if lower, 0
+  mutate(test_higher = 
+            replace(test_higher, median_rho < quantile_rho_95_ran, 0)) %>% 
+  group_by(sub) %>% 
+  summarise(number_library_size = n(),
+            sum_test_higher = sum(test_higher)) %>% 
+  # if at least 90% of library sizes pass median > quantile_95_ran = defalt 1
+  mutate(pass = 1) %>% 
+  mutate(pass = replace(pass, sum_test_higher < 0.9* number_library_size, 0))
+
+```
+
+
+##--------ccm abundance ~ temp
+
+## run ccm abundance ~ temp, output in <ccm.ori.a.t>
+
+```{r}
+
+# run ccm for stability
+(ccm.no.a.t <- function_ccm(SUB = 'northwestern',
+                       OPTIMAL_E = e.no.a[2], 
+                       LIB = 'abundance_scale', 
+                       TARGET = 'temp_ctd_scale'))
+
+(ccm.so.a.t <- function_ccm(SUB = 'southern',
+                       OPTIMAL_E = e.so.a[2],
+                       LIB = 'abundance_scale', 
+                       TARGET = 'temp_ctd_scale'))
+
+(ccm.vi.a.t <- function_ccm(SUB = 'viking',
+                       OPTIMAL_E = e.vi.a[2],
+                       LIB = 'abundance_scale', 
+                       TARGET = 'temp_ctd_scale'))
+
+
+# bind 3 subpoplations into one tibble <plot.ori>
+ccm.ori.a.t <- bind_rows(ccm.no.a.t,ccm.so.a.t,ccm.vi.a.t)
+ccm.ori.a.t <- ccm.ori.a.t %>% 
+  relocate(sub,.before = 'lib_size')
+```
+
+
+## Mann-Kendall test 
+
+no: tau = 0.143, 2-sided pvalue =0.29506
+so: tau = 0.894, 2-sided pvalue =< 2.22e-16
+vi: tau = 0.841, 2-sided pvalue =< 2.22e-16
+
+```{r}
+
+(ken.no.a.t <- fun_kendall(ccm.no.a.t))
+(ken.so.a.t <- fun_kendall(ccm.so.a.t))
+(ken.vi.a.t <- fun_kendall(ccm.vi.a.t))
+
+```
+
+
+## create random time series
+```{r}
+
+## random shuffle row-wise (keep correspondence of x & y) 
+
+fun_random <- function(SUB, DRIVER){
+  out <- list()
+  
+  dd <- driver.sub %>% filter(sub == SUB) %>% 
+    # 20250415 change to year, abundnace_scale, temp_ctd_scale
+  #dplyr::select(year, stability, fishing24) 
+    dplyr::select(year, abundance_scale, temp_ctd_scale) 
+    
+  for (i in 1:5000){
+    out[[i]]<- dd %>% slice(sample(1:n()))
+  }
+  out
+}
+
+random.list.no.a.t <- fun_random('northwestern')
+random.list.so.a.t <- fun_random('southern')
+random.list.vi.a.t <- fun_random('viking')
+
+```
+
+
+## run ccm for randomised time series 
+
+```{r}
+
+# function
+fun_ccm_random <- function(dd, OPTIMAL_E, SUB){
+  
+  out.list <- list()
+  
+  for (i in 1:length(dd)){
+  ccm.out <- ccm(dd[[i]], E = 5, tp = 0, 
+               lib_column = 'abundance_scale',
+               target_column = 'temp_ctd_scale', 
+               lib_sizes = seq(10, 37,by = 1), 
+               # for each random time series 1 bootstrap
+               num_samples = 1, 
+               replace = T)
+  
+  ccm.out <- as.tibble(ccm.out)
+  
+  ccm.out <- ccm.out %>%
+  dplyr::select(lib_size, rho) %>% 
+  mutate(random_number = i) 
+  
+  out.list[[i]] <- ccm.out
+  
+  }
+  out.list <- bind_rows(out.list)
+  out.list <- out.list %>% 
+    mutate(sub = SUB)
+  }
+
+
+# run fun_ccm_random
+out.ccm.ran.no.a.t <- fun_ccm_random (random.list.no.a.t, e.no.a,
+                                  'northwestern')
+out.ccm.ran.so.a.t <- fun_ccm_random (random.list.so.a.t, e.so.a,
+                                  'southern')
+out.ccm.ran.vi.a.t <- fun_ccm_random (random.list.vi.a.t, e.vi.a,
+                                  'viking')
+
+# join 3 subpopulations into one tibble
+ccm.ran.a.t <- bind_rows(out.ccm.ran.no.a.t,
+                       out.ccm.ran.so.a.t,
+                       out.ccm.ran.vi.a.t )
+
+# save ccm.ran with output from 5000 random time series (before compiling to median)
+write.csv(ccm.ran.a.t,"/Users/hsiaohang.tao/Dropbox/a_Chang_MDR/Demo_R_Code_MDR_S-MAP/mc_subpopulation/output/ccm_step_by_step/ccm.ran.5000.abu.tem.csv")
+
+
+# compute median and quantile 
+ccm.ran.a.t <- ccm.ran.a.t %>% 
+  relocate(sub,.before = 'lib_size') %>% 
+  group_by(sub, lib_size) %>% 
+  summarise(median_rho_ran = median(rho),
+            quantile_rho_5_ran = quantile(rho, 0.05),
+            quantile_rho_95_ran = quantile(rho, 0.95))
+
+```
+
+
+## join ccm outputs from original and randomised time series 
+
+```{r}
+
+ccm.ori.a.t # tibble for ccm output from original time series
+ccm.ran.a.t # tibble for ccm ouptut from random time series
+
+dd.ori.ran.a.t <- inner_join(ccm.ori.a.t, ccm.ran.a.t, by = c('sub','lib_size'))
+
+# save dd.ori.ran
+write.csv(dd.ori.ran.a.t,"/Users/hsiaohang.tao/Dropbox/a_Chang_MDR/Demo_R_Code_MDR_S-MAP/mc_subpopulation/output/ccm_step_by_step/ccm.ori.ran.abu.tem.csv")
+
+```
+
+
+## plot abundance ~ temp
+
+results of Kendall's test 
+no: tau = 0.143, 2-sided pvalue =0.29506
+so: tau = 0.894, 2-sided pvalue =< 2.22e-16
+vi: tau = 0.841, 2-sided pvalue =< 2.22e-16
+
+```{r}
+
+# read data
+dd.ori.ran.a.t <- read.csv("/Users/hsiaohang.tao/Dropbox/a_Chang_MDR/Demo_R_Code_MDR_S-MAP/mc_subpopulation/output/ccm_step_by_step/ccm.ori.ran.abu.tem.csv")
+
+
+## create text for Kendall's result
+dat_text <- data.frame(
+  label = c("tau = 0.14, p = 0.30", 
+            "tau = 0.89, p < 0.05", 
+            "tau = 0.84, p < 0.05"),
+  sub   = c('northwestern', 'southern', 'viking')
+)
+
+ggplot(dd.ori.ran.a.t, aes(x = lib_size))+
+  geom_line(aes(y = median_rho),color = '#56B4E9')+
+  geom_line(aes(y = quantile_rho_5),linetype = 'dashed',
+            color = '#56B4E9')+
+  geom_line(aes(y = quantile_rho_95), linetype = 'dashed',
+            color = '#56B4E9')+
+  geom_ribbon(aes(ymax=quantile_rho_95,
+                  ymin=quantile_rho_5), 
+              fill="#56B4E9", alpha=0.25) +
+  geom_line(aes(y = median_rho_ran))+
+  geom_line(aes(y = quantile_rho_5_ran),
+            linetype = 'dashed')+
+  geom_line(aes(y = quantile_rho_95_ran), 
+            linetype = 'dashed')+
+  geom_ribbon(aes(ymax=quantile_rho_95_ran,
+                  ymin=quantile_rho_5_ran), 
+              fill="grey", alpha=0.25) +
+  ggtitle('')+
+  facet_wrap(vars(sub))+
+   theme_bw()+
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank(),
+        axis.title.y = element_text(angle = 0, vjust = 0.5))+
+  geom_text(data = dat_text,
+  mapping = aes(x = -Inf, y = -Inf, label = label),
+  hjust   = -0.1,
+  vjust   = c(-0.5,-0.5,-0.5))+
+    ylab('Effect of temp. \n on abundance')+
+  xlab('Library size')
+
+
+```
+
+
+## check significance of ccm 
+
+```{r}
+
+dd.ori.ran.a.t %>% 
+  # if median_rho is higher than quantile_95_ran = default 1
+  mutate(test_higher = 1) %>%
+  # if lower, 0
+  mutate(test_higher = 
+            replace(test_higher, median_rho < quantile_rho_95_ran, 0)) %>% 
+  group_by(sub) %>% 
+  summarise(number_library_size = n(),
+            sum_test_higher = sum(test_higher)) %>% 
+  # if at least 90% of library sizes pass median > quantile_95_ran = defalt 1
+  mutate(pass = 1) %>% 
+  mutate(pass = replace(pass, sum_test_higher < 0.9* number_library_size, 0))
+
+```
+

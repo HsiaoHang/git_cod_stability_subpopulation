@@ -1,0 +1,552 @@
+---
+title: "stability_subpopulation"
+output: html_document
+date: "2025-01-15"
+editor_options: 
+  chunk_output_type: inline
+---
+
+This script is divided into three parts:
+1. calculate dynamical stability, plot dynamical stability, abundance, and age structure
+2. calculate relative sensitivity of age groups and plot
+3. plot age group interaction network 
+
+# set directory
+```{r}
+
+# set directory
+dr <- "/Users/hsiaohang.tao/Dropbox/a_Chang_MDR/Demo_R_Code_MDR_S-MAP/mc_subpopulation"
+
+```
+
+
+# load packages
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+library("tidyverse")
+library("purrr")
+library("mapplots")
+library("ggplot2")
+library("gridExtra")
+library("igraph")
+library(igraphdata)
+library("ggplot2")
+library(grid)
+library(cowplot)
+library(ggtext)
+library(zoo)
+library(readxl)
+library(vegan)
+library(rEDM) 
+packageVersion("rEDM")
+library(doParallel)
+library(parallel)
+library(foreach)
+library(Kendall)
+library(MASS)
+library(dplyr)
+library(glmnet)
+
+```
+
+
+# code settings
+
+```{r}
+
+seed <- 49563
+set.seed(seed)
+SaveFile <- T #T/F for saving files
+
+```
+
+
+# source <Demo_MDR_function.R>
+
+```{r}
+
+source("/Users/hsiaohang.tao/Dropbox/a_Chang_MDR/Demo_R_Code_MDR_S-MAP/mc/script/Demo_MDR_function.R")
+
+```
+
+
+# load ccm.fast.demo.seq.1 
+
+same function as in <smap_sub.Rmd>
+
+```{r}
+
+ccm.fast.demo.seq.1 <- function(ds,Epair=T,cri='rmse',Emax=10){
+  if(cri=='rho'){jfun <- match.fun('which.max')}else{jfun <- match.fun('which.min')}
+  ds <- as.matrix(apply(ds,2,scale))
+  np <- nrow(ds) # time series length
+  ns <- ncol(ds) # number of nodes
+  #lib.s <- c(seq(10,nrow(ds),10),nrow(ds)) # sequence of library size
+  lib.s <- c(seq(10,nrow(ds),1),nrow(ds))
+  crirho <- qt(0.95,np-1)/(np-2+qt(0.95,np-1)^2) # critical values with alpha=0.05
+  ccm.rho <- ccm.sig <- matrix(0,ns,ns)
+  for(i in 1:ns){
+    t.begin <- proc.time()
+    for(j in 1:ns){
+      # select the optimal E for CCM based on hindcast at time= t-1 (tp=-1)
+      ccm.E <- NULL  
+      for(E.t in 2:Emax){
+        ccm.E <- rbind(ccm.E,ccm(cbind(x=ds[,i],y=ds[,j]), E = E.t, tp=-1,
+                              lib_column = "x", target_column = "y", 
+                              lib_sizes = nrow(ds),  random_libs =F))
+      }
+      Eop <- ccm.E[jfun(ccm.E[,cri]),'E'] # The optimal E for the cross-mapping from node i to node j 
+      
+      
+      # Perform CCM at time t (tp=0)      
+      ccm.out <- ccm(cbind(x=ds[,i],y=ds[,j]), E = Eop, tp=0, 
+                  lib_column = "x", target_column = "y", 
+                  lib_sizes = lib.s,  random_libs =F)
+      # aggregate the results with respect to each library size
+      ccm.seq <- aggregate(ccm.out[,'rho'],list(ccm.out[,'lib_size']),mean,na.rm=T)
+      ccm.seq <- ccm.seq[!(is.na(ccm.seq[,2])|is.infinite(ccm.seq[,2])),]
+      ccm.seq[ccm.seq[,2]<0,2] <- 0
+      termrho <- ccm.seq[nrow(ccm.seq),2]  # rho at the maximal library size (terminal rho)
+      if(nrow(ccm.seq)>=3){
+        kend <- MannKendall(ccm.seq[,2]);  # Kendall's tau test for mononotic increase
+        # Causation is significant only if both (1) Kendall's tau and (2) terminal rho are significantly larger than zero
+        ccm.sig[i,j] <- (kend$tau[1]>0)*(kend$sl[1]<0.05)*(termrho>crirho) # ccm.sig records the significance of each CCM
+      }else{ccm.sig[i,j] <- 0}
+      ccm.rho[i,j] <- termrho                                              # ccm.rho records the terminal rho
+    }#end of j
+    time.used <- proc.time() - t.begin 
+    cat("variable", i, "ccm completed:", time.used[3],"sec\n")
+  }#end of i
+  return(list(ccm.rho=ccm.rho,ccm.sig=ccm.sig))  
+}
+
+```
+
+
+# read jacobian matrix [sub_jcof.csv]
+ 
+It is generated from <smap_sub.Rmd>
+ 
+```{r}
+
+file.name <- paste0(dr, sep = "/","output/sub.jcof.csv")
+ja.sub <- read.csv(file.name, header = T)
+
+```
+
+
+# read subpopulation data and arrange <dd.sub>
+<subpopulation_data.csv>
+[[1]] northwestern
+[[2]] southern
+[[3]] viking
+
+```{r}
+
+file.name <- paste0(dr, sep = "/","data/raw_data/subpopulation_data.xlsx")
+dd.sub <- read_excel(file.name)
+
+```
+
+# set theme_s for graphs
+```{r}
+
+theme_s <- scale_x_continuous(breaks = seq(1983, 2024, by = 10))
+
+```
+
+
+#---- 1. estimate stability, plot stability, abundance
+
+# use [ja.sub] to estimate stability, save in [sta.dd.sub] 
+[[1]] northwestern
+[[2]] southern
+[[3]] viking
+
+```{r}
+
+ja.sub
+
+# read & clean [ja]
+ja.sub <- as.tibble(ja.sub)
+
+ja.sub <- ja.sub %>% 
+  dplyr::select (-j0) 
+
+
+# convert ja.sub to 3 lists by subpopulation
+ja.sub.list <- ja.sub %>% 
+  group_split(subarea)
+
+
+# run eigen analysis
+list_result <- list()
+list_result <- vector(mode = 'list', length = 3)
+
+for (j in 1:3) {
+  for (i in 1:41) {
+    dd <- ja.sub.list[[j]] %>% filter(time == i)
+  m <- dd[,4:10]
+  # clark's code
+  ei.t <- eigen(m)
+  ind <- which.max(abs(ei.t$values))
+  dev <- abs(ei.t$values[ind]) # add abs() to extract
+  list_result[[j]][i] <- dev
+  }
+}
+
+
+# unlist the results
+sta.dd.sub <- tibble(subpopulation = rep(1:3, each = 41),
+                 Year = rep(seq(from = 1983, to = 2023, 1),3), Abs.dev = unlist(list_result))
+
+# rename sub-population
+sta.dd.sub <- sta.dd.sub %>% 
+   mutate(subpopulation = 
+            replace(subpopulation, subpopulation==1,
+                    "northwestern")) %>% 
+   mutate(subpopulation = replace(subpopulation, 
+                                  subpopulation ==2, 
+                                  "southern")) %>% 
+  mutate(subpopulation = replace(subpopulation, 
+                                  subpopulation ==3, 
+                                  "viking"))
+  
+sta.dd.sub  
+
+# save sta.dd.sub in output folder
+file.name <- paste0(dr, sep = "/","output/sta.dd.sub.csv")
+write.csv(sta.dd.sub,file.name)
+
+```
+
+
+# plot total abundance & age structure as <age.abu.plot.sub> 
+
+```{r}
+
+# transform dd.sub into long form
+
+(dd.sub.long <- dd.sub %>% 
+  dplyr::select(-total) %>% 
+  group_by(region, year) %>% 
+  pivot_longer(cols = starts_with('a'),
+               names_to = 'age',
+               values_to = 'est_num_1000',
+               #remove a before each age
+               names_prefix = 'a') %>% 
+  group_by(region, year) %>% 
+  mutate (est_num_1000_all = sum(est_num_1000)) %>% 
+  rename(subpopulation = region))
+
+
+# plot total abundance and age structure
+
+(age.abu.plot.sub <- dd.sub.long %>% 
+  ggplot()+
+    facet_wrap(vars(subpopulation))+
+   geom_area(aes(x=year, y=(est_num_1000/1000), fill=age))+
+  geom_line(aes(x = year, 
+                y = est_num_1000_all/1000), size = 1)+
+    
+  ylab("Abundance \n(thousand)")+
+  theme_bw() +
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        #panel.border = element_blank(),
+        legend.position = 'top',
+        axis.title.y = element_text(angle = 0, vjust = 0.5))+
+    theme_s+
+    scale_fill_brewer(palette="Paired")+
+    xlab('Year')+
+   guides(fill = guide_legend(nrow = 1)))
+
+
+```
+
+
+# plot stability <sta.plot.sub>
+
+```{r}
+
+(sta.plot.sub <- ggplot(sta.dd.sub)+ 
+  geom_line(size = 1,aes(x = Year, y = Abs.dev))+
+  xlab("Year")+
+  ylab("Stability \n|DEV|")+
+   facet_wrap(vars(subpopulation))+
+  theme_bw()+
+  theme_s+
+  geom_hline(yintercept=1, linetype="dashed")+
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        legend.position = c(0.9, 0.7),
+        axis.title.y = element_text(angle = 0, vjust = 0.5)))
+  
+
+```
+
+
+# bind abundance & stability plots
+
+```{r}
+
+plot_grid(age.abu.plot.sub, sta.plot.sub, ncol = 1, align = 'v', rel_heights = c(1.3,1))
+
+```
+
+
+#----- 2. relative sensitivity
+
+# calculate eigenvector alignment as [eigen.sub]
+
+```{r}
+
+ja.sub.list
+
+# for loop moving forward one point at a time
+list_eigen_sub <- list()
+list_eigen_sub <- vector(mode = 'list', length = 3)
+
+for (j in 1:3){
+  for(i in 1:41){
+  dd <- ja.sub.list[[j]] %>% filter(time == i)
+  m <- dd[,4:10]
+  ## order eigenvalue
+  order_values <- order(Re(eigen(m)$values), decreasing = TRUE)
+  ## extract dominant eigenvector
+  smap_eigenvector <- Re(eigen(m)$vectors)[order_values[1],]
+  ## standardize and take absolute value for each element
+  eigen_alignments <- abs(smap_eigenvector / sqrt(sum(smap_eigenvector^2)))
+  # store result
+  list_eigen_sub [[j]][[i]] <- eigen_alignments
+}
+  }
+
+
+# unlist the results
+eigen.sub <- tibble(
+  sub = rep(1:3, each = 7*41),
+  age = rep(seq(from = 1, to = 7, 1), times = 41*3), 
+  year = rep(rep(seq(from = 1983, to = 2023, 1), each = 7),times = 3),
+  eigen_sub = unlist(list_eigen_sub)) %>% 
+  mutate_at("age", as.factor) %>% 
+  mutate(sub=replace(sub, sub==1, 'Northwestern'),
+         sub=replace(sub, sub==2, 'Southern'),
+         sub=replace(sub, sub==3, 'Viking'))
+
+```
+
+
+# plot eigen age as individual panel
+```{r}
+
+eigen.sub
+
+age_names <- c(
+                    `1` = "age 1",
+                    `2` = "age 2",
+                    `3` = "age 3",
+                    `4` = "age 4",
+                    `5` = "age 5",
+                    `6` = "age 6"
+                    )
+
+ggplot(eigen.sub,
+       aes(x = year, y = eigen_sub))+ 
+  #geom_point()+
+  geom_line()+
+  facet_grid(vars(age), vars(sub))+
+  xlab("Year")+
+  ylab("")+
+  theme_bw()+
+  theme(
+        axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank())+
+  # set lable position and rotate
+  theme(strip.background = element_blank(),
+    strip.placement = "outside",
+    strip.text.y.left = element_text(angle = 0)
+  )+
+  scale_y_continuous(breaks = seq(0, 1, by = 0.3))+
+  # rotate y lable
+  #theme(axis.title.y = element_text(angle = 0, vjust = 0.5))+
+  ggtitle("Relative contribution to population stability")
+
+    
+```
+
+
+# plot eigen age as colored lines  <eig.plot.sub.col>
+```{r}
+
+
+eig.plot.sub.col <- ggplot(eigen.sub,
+       aes(x = year, y = eigen_sub, color = age))+ 
+  geom_line()+
+  facet_wrap(vars(sub))+
+  xlab("Year")+
+  theme_bw()+
+  theme(
+        axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.title.y = element_text(angle = 0, vjust = 0.5))+
+  scale_y_continuous(breaks = seq(0, 1, by = 0.3))+
+   scale_colour_brewer(palette="Paired")+ theme_s +
+   ylab('Relative \n sensitivity')
+
+eig.plot.sub.col
+
+```
+
+
+#----- 3. age group interactions
+
+# transform ja.sub to long form <ja.sub.long>
+
+Note that for jacobian matrix output [ja], columns "A1","A2","A3","A4","A5","A6", "A7" are explanatory variables. The second column named "variable" is the responsible variable (predicted age). This direction is the same as the jacobian matrix.
+
+output 7 x 10
+```{r}
+
+ja.sub.long <- ja.sub %>%
+ pivot_longer(
+   cols = c("a1","a2","a3","a4","a5","a6",'a7'),
+   names_to = "explanatory_age",
+   values_to = "jacobian",
+   values_drop_na = TRUE) %>% 
+  mutate (response_age = 
+            paste("a", sep = "", variable)) %>% 
+  #select(-variable) %>% 
+  relocate(response_age, .before = jacobian) %>% 
+  mutate(year = 1982+time) %>% 
+  rename(sub = subarea) %>% 
+  mutate(sub=replace(sub, sub==1, 'Northwestern'),
+         sub=replace(sub, sub==2, 'Southern'),
+         sub=replace(sub, sub==3, 'Viking'))
+  
+```
+
+
+# compute Jii-1 and create <ja.sub.long.1>
+
+according to miki et al 2024 https://www.sciencedirect.com/science/article/pii/S0167278925000922, self-regulation should be calculated as the jacobian element minus one
+
+```{r}
+
+ja.sub.long.1 <- ja.sub.long %>% 
+   mutate(jacobian = ifelse(explanatory_age == response_age,jacobian-1 , jacobian))
+  
+```
+
+
+# plot all interactions over time
+
+```{r}
+
+# plot each age as predicted variable
+
+fun_plot_interaction <- function(filter_res_age, title){
+  dd <- ja.sub.long.1 %>% filter(response_age  == filter_res_age) 
+  ggplot(dd,aes(x = year, y = jacobian, color = explanatory_age))+ 
+  #geom_point()+
+    facet_wrap(vars(sub))+
+  geom_line()+theme_bw()+ 
+    ylim(-2.3, 2.3)+
+    ylab('Interaction strength')+ xlab('Year')+
+    ggtitle(paste0(title, 
+                   sep = " ", 
+                   "as predictor"))+
+    scale_x_continuous(breaks = seq(1980, 2030, by = 5))+
+    scale_colour_brewer(palette="Paired")+
+    theme_bw() +
+      labs( col="explanatory age")+
+
+  theme(axis.line = element_line(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        panel.border = element_blank())
+}
+
+
+p1 <- fun_plot_interaction(filter_res_age = "a1", title = "age-1 group")
+p2 <- fun_plot_interaction(filter_res_age = "a2", title = "age-2 group")
+p3 <- fun_plot_interaction(filter_res_age = "a3", title = "age-3 group")
+p4 <- fun_plot_interaction(filter_res_age = "a4", title = "age-4 group")
+p5 <- fun_plot_interaction(filter_res_age = "a5", title = "age-5 group")
+p6 <- fun_plot_interaction(filter_res_age = "a6", title = "age-6+ group")
+p7 <- fun_plot_interaction(filter_res_age = "a7", title = "age-6+ group")
+
+grid.arrange(p1,p2,p3,p4,p5,p6,p7, ncol=2) 
+
+```
+
+
+# calculate mean jacobian & assign sign & strength <ja.sub.mean>, save as <mean.age.interaction.csv>
+
+categorize to positive or negative with weak, medium, or strong links
+
+```{r}
+
+# calculate mean jacobian over time
+ja.sub.mean <- ja.sub.long.1 %>% group_by(sub, explanatory_age, response_age) %>%
+  summarise(mean_ja = mean(jacobian)) 
+
+
+ja.sub.mean <- ja.sub.mean %>% 
+  mutate(mean_ja_sign = 
+           ifelse((mean_ja > 0), 
+                  "positive", "negative")) %>% 
+  # create mean_jacobian_strength for positive values
+  mutate(mean_ja_strength = 
+           replace(mean_ja,
+                   between(mean_ja, 0, 0.3), 
+                   "weak")) %>% 
+  mutate(mean_ja_strength = 
+           replace(mean_ja_strength,
+                   between(mean_ja, 0.3,0.6), 
+                   "medium")) %>% 
+  mutate(mean_ja_strength = 
+           replace(mean_ja_strength,
+                  mean_ja > 0.6, 
+                   "strong")) %>% 
+  # create mean_jacobian_strength for negative values
+  mutate(mean_ja_strength = 
+           replace(mean_ja_strength,
+                   between(mean_ja, -0.3, 0), 
+                   "weak")) %>% 
+  mutate(mean_ja_strength = 
+           replace(mean_ja_strength,
+                   between(mean_ja, -0.6,-0.3), 
+                   "medium")) %>% 
+  mutate(mean_ja_strength = 
+           replace(mean_ja_strength,
+                  mean_ja < - 0.6, 
+                   "strong")) 
+
+# check max and min of jacobian
+ja.sub.mean %>% group_by(sub) %>% 
+  summarise(max = max(mean_ja),
+            min = min(mean_ja))
+
+# round to digital = 3
+ja.sub.mean <- ja.sub.mean %>% 
+  mutate_at('mean_ja', round, 3)
+
+# save interaction strength as excel as supplement
+
+file.name <- paste0(dr, sep = "/","output/mean.age.interaction.csv")
+write.csv(ja.sub.mean, file.name)
+
+```
+
