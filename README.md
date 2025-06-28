@@ -9,7 +9,7 @@ a. The data folder contains
 2. [temp.ctd.csv] and [fishing_mortality_sub.xlsx] These are temperature and fishing mortality data.
 
 
-b. The script folder contains six R scripts:
+b. The script folder contains five R scripts:
 
 1. [Demo_MDR_function.R] 
 This script is from Chang et al. 2021 https://onlinelibrary.wiley.com/doi/10.1111/ele.13897. It provides functions to run MDR-Smap.
